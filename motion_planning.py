@@ -5,11 +5,20 @@ from enum import Enum, auto
 
 import numpy as np
 
-from planning_utils import a_star, heuristic, create_grid
+from planning_utils import a_star_graph, heuristic, create_grid_and_edges, closest_graph_point, check_edge
 from udacidrone import Drone
 from udacidrone.connection import MavlinkConnection
 from udacidrone.messaging import MsgID
 from udacidrone.frame_utils import global_to_local
+
+import pkg_resources
+pkg_resources.require("networkx==2.1")
+import networkx as nx
+
+from pruning import get_pruned_path
+import matplotlib as mpl
+mpl.use('tkagg')
+import matplotlib.pyplot as plt
 
 
 class States(Enum):
@@ -40,6 +49,7 @@ class MotionPlanning(Drone):
         self.register_callback(MsgID.LOCAL_VELOCITY, self.velocity_callback)
         self.register_callback(MsgID.STATE, self.state_callback)
 
+
     def local_position_callback(self):
         if self.flight_state == States.TAKEOFF:
             if -1.0 * self.local_position[2] > 0.95 * self.target_position[2]:
@@ -54,6 +64,7 @@ class MotionPlanning(Drone):
 
     def velocity_callback(self):
         if self.flight_state == States.LANDING:
+            #print(self.global_position, self.global_home)
             if self.global_position[2] - self.global_home[2] < 0.1:
                 if abs(self.local_position[2]) < 0.01:
                     self.disarming_transition()
@@ -80,6 +91,7 @@ class MotionPlanning(Drone):
     def takeoff_transition(self):
         self.flight_state = States.TAKEOFF
         print("takeoff transition")
+        print('alt:', self.local_position, self.target_position)
         self.takeoff(self.target_position[2])
 
     def waypoint_transition(self):
@@ -107,6 +119,7 @@ class MotionPlanning(Drone):
         self.in_mission = False
 
     def send_waypoints(self):
+        print(self.waypoints)
         print("Sending waypoints to simulator ...")
         data = msgpack.dumps(self.waypoints)
         self.connection._master.write(data)
@@ -114,48 +127,110 @@ class MotionPlanning(Drone):
     def plan_path(self):
         self.flight_state = States.PLANNING
         print("Searching for a path ...")
-        TARGET_ALTITUDE = 5
+        TARGET_ALTITUDE = 15
         SAFETY_DISTANCE = 5
 
         self.target_position[2] = TARGET_ALTITUDE
 
-        # TODO: read lat0, lon0 from colliders into floating point values
-        
-        # TODO: set home position to (lon0, lat0, 0)
+        # read lat0, lon0 from colliders into floating point values
+        filename = 'colliders.csv'
+        with open(filename) as fd:
+            line = fd.readline().split(',')
+        lat0 = float(line[0].split(' ')[-1])   
+        lon0 = float(line[1].split(' ')[-1])
+        print('start position: lat: {}. lon: {}'.format(lat0, lon0))
 
-        # TODO: retrieve current global position
+        # set home position to (lon0, lat0, 0)
+        self.set_home_position(lon0, lat0, 0)
+
+        # retrieve current global position
+        global_position = [self._longitude, self._latitude, self._altitude]
  
-        # TODO: convert to current local position using global_to_local()
+        # convert to current local position using global_to_local()
+        local_position = global_to_local(global_position=self.global_position, global_home=self.global_home)
+        print(local_position)
+        print(self.local_position)
+
         
-        print('global home {0}, position {1}, local position {2}'.format(self.global_home, self.global_position,
+        print('global home {0}, \nposition {1}, \nlocal position {2}'.format(self.global_home, self.global_position,
                                                                          self.local_position))
+        
         # Read in obstacle map
         data = np.loadtxt('colliders.csv', delimiter=',', dtype='Float64', skiprows=2)
         
         # Define a grid for a particular altitude and safety margin around obstacles
-        grid, north_offset, east_offset = create_grid(data, TARGET_ALTITUDE, SAFETY_DISTANCE)
+        t_start = time.time()
+        grid, north_offset, east_offset, edges = create_grid_and_edges(data, TARGET_ALTITUDE, SAFETY_DISTANCE)
+        print('time to create grid and edegs: {:.4} seconds'.format((time.time() - t_start)))
         print("North offset = {0}, east offset = {1}".format(north_offset, east_offset))
-        # Define starting point on the grid (this is just grid center)
-        grid_start = (-north_offset, -east_offset)
-        # TODO: convert start position to current position rather than map center
         
+        # Define starting point on the grid (this is just grid center)
+        grid_start = (75, 25)
+        
+        # convert start position to current position rather than map center
+        grid_start = (int(local_position[0]) - north_offset, int(local_position[1])-east_offset)
+
         # Set goal as some arbitrary position on the grid
-        grid_goal = (-north_offset + 10, -east_offset + 10)
-        # TODO: adapt to set goal as latitude / longitude position and convert
+        global_goal = ( -122.397730, 37.796581, 0)  # middle of park
+        #global_goal = (-122.398764, 37.793361, 0) # intersection
 
-        # Run A* to find a path from start to goal
-        # TODO: add diagonal motions with a cost of sqrt(2) to your A* implementation
-        # or move to a different search space such as a graph (not done here)
+        # adapt for goal set as latitude / longitude position and convert
+
+        global_goal_wp = global_to_local(global_goal, self.global_home)
+        grid_goal = (global_goal_wp[0]-north_offset, global_goal_wp[1] - east_offset)
+        print('local goal:', grid_goal)
+        #grid_goal = (-north_offset + 150, -east_offset + 150)   
+        #grid_goal = (750, 370)
+
+        # Run A* to find a path from start to goal       
         print('Local Start and Goal: ', grid_start, grid_goal)
-        path, _ = a_star(grid, heuristic, grid_start, grid_goal)
-        # TODO: prune path to minimize number of waypoints
-        # TODO (if you're feeling ambitious): Try a different approach altogether!
+        print('executing A*')
+        t_start = time.time()
+        g = nx.Graph()
+        for e in edges:
+            p1 = e[0]
+            p2 = e[1]
+            w = np.linalg.norm(np.array(p2) - np.array(p1))
+            g.add_edge(p1, p2, weight=w)
+        start_node = closest_graph_point(g, grid_start)
+        goal_node = closest_graph_point(g, grid_goal)
+        print('end points: ', start_node, goal_node)
 
-        # Convert path to waypoints
-        waypoints = [[p[0] + north_offset, p[1] + east_offset, TARGET_ALTITUDE, 0] for p in path]
-        # Set self.waypoints
+        print('time for A*: {:.4} seconds'.format((time.time() - t_start)))
+
+        path, cost = a_star_graph(g, heuristic, start_node, goal_node)
+        print('path length: {}    path cost: {}'.format(len(path),cost))
+
+        # prune path to minimize number of waypoints
+        pruned_path = get_pruned_path(path, grid)
+        print('path length after pruning: {}'.format(len(pruned_path)))
+
+        # if True:
+
+        #     plt.imshow(grid, origin='lower', cmap='Greys') 
+
+        #     for e in edges:
+        #         p1 = e[0]
+        #         p2 = e[1]
+        #         plt.plot([p1[1], p2[1]], [p1[0], p2[0]], 'b-')
+            
+        #     for i in range(len(pruned_path)-1):
+        #         p1 = pruned_path[i]
+        #         p2 = pruned_path[i+1]
+        #         plt.plot([p1[1], p2[1]], [p1[0], p2[0]], 'g-')
+                                
+        #     plt.plot(grid_start[1], grid_start[0], 'gx', markeredgewidth=6, markersize=12)
+        #     plt.plot(grid_goal[1], grid_goal[0], 'gx', markeredgewidth=6, markersize=12)
+
+        #     plt.xlabel('EAST', fontsize=20)
+        #     plt.ylabel('NORTH', fontsize=20)
+        #     #plt.show()
+        #     plt.savefig('pruned_plan.png', format= 'png')
+
+        # # Convert path to waypoints
+        waypoints = [[int(p[0] + north_offset), int(p[1] + east_offset), TARGET_ALTITUDE, 0] for p in pruned_path]
         self.waypoints = waypoints
-        # TODO: send waypoints to sim (this is just for visualization of waypoints)
+        # send waypoints to sim (this is just for visualization of waypoints)
         self.send_waypoints()
 
     def start(self):
@@ -164,7 +239,7 @@ class MotionPlanning(Drone):
         print("starting connection")
         self.connection.start()
 
-        # Only required if they do threaded
+        # Only required threaded
         # while self.in_mission:
         #    pass
 
