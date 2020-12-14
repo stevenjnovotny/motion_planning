@@ -66,8 +66,10 @@ class MotionPlanning(Drone):
         if self.flight_state == States.LANDING:
             #print(self.global_position, self.global_home)
             if self.global_position[2] - self.global_home[2] < 0.1:
+            # if abs(self.global_position[2] - self.global_goal[2]) < 0.1:
                 if abs(self.local_position[2]) < 0.01:
                     self.disarming_transition()
+                #self.disarming_transition()
 
     def state_callback(self):
         if self.in_mission:
@@ -148,11 +150,11 @@ class MotionPlanning(Drone):
  
         # convert to current local position using global_to_local()
         local_position = global_to_local(global_position=self.global_position, global_home=self.global_home)
-        print(local_position)
-        print(self.local_position)
+        # print(local_position)
+        # print(self.local_position)
 
         
-        print('global home {0}, \nposition {1}, \nlocal position {2}'.format(self.global_home, self.global_position,
+        print('global home {0}, \nglobal position {1}, \nlocal position {2}'.format(self.global_home, self.global_position,
                                                                          self.local_position))
         
         # Read in obstacle map
@@ -173,6 +175,8 @@ class MotionPlanning(Drone):
         # Set goal as some arbitrary position on the grid
         global_goal = ( -122.397730, 37.796581, 0)  # middle of park
         #global_goal = (-122.398764, 37.793361, 0) # intersection
+        #global_goal = ( -122.400651, 37.796574, 3.0) # top of building'
+        self.global_goal = global_goal
 
         # adapt for goal set as latitude / longitude position and convert
 
@@ -252,7 +256,7 @@ if __name__ == "__main__":
     parser.add_argument('--host', type=str, default='127.0.0.1', help="host address, i.e. '127.0.0.1'")
     args = parser.parse_args()
 
-    conn = MavlinkConnection('tcp:{0}:{1}'.format(args.host, args.port), timeout=60)
+    conn = MavlinkConnection('tcp:{0}:{1}'.format(args.host, args.port), timeout=360)
     drone = MotionPlanning(conn)
     time.sleep(1)
 
